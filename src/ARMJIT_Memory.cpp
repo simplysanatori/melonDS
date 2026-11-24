@@ -171,17 +171,37 @@ static MapViewOfFile3Type mapViewOfFile3Ptr;
 
 LONG ARMJIT_Memory::ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
 {
-    if (exceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+    if (exceptionInfo == nullptr ||
+        exceptionInfo->ExceptionRecord == nullptr ||
+        exceptionInfo->ContextRecord == nullptr ||
+        exceptionInfo->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
     {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
-    FaultDescription desc {};
-    desc.EmulatedFaultAddr = (u8*)exceptionInfo->ExceptionRecord->ExceptionInformation[1] - curArea;
-    desc.FaultPC = (u8*)exceptionInfo->ContextRecord->CONTEXT_PC;
+    melonDS::NDS* cur = NDS::Current;
+    if (cur == nullptr)
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
-    if (FaultHandler(desc, *NDS::Current))
+    u8* faultPC = (u8*)exceptionInfo->ContextRecord->CONTEXT_PC;
+    u8* curArea = (u8*)(cur->CurCPU == 0 ? cur->JIT.Memory.FastMem9Start : cur->JIT.Memory.FastMem7Start);
+    uintptr_t faultAddr = static_cast<uintptr_t>(exceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+    uintptr_t areaStart = reinterpret_cast<uintptr_t>(curArea);
+
+    if (curArea == nullptr ||
+        faultAddr < areaStart || (faultAddr - areaStart) >= AddrSpaceSize ||
+        !cur->JIT.JITCompiler.IsJITFault(faultPC))
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    FaultDescription desc {};
+    desc.EmulatedFaultAddr = static_cast<u32>(faultAddr - areaStart);
+    desc.FaultPC = faultPC;
+
+    if (FaultHandler(desc, *cur))
     {
         exceptionInfo->ContextRecord->CONTEXT_PC = (u64)desc.FaultPC;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -193,58 +213,83 @@ LONG ARMJIT_Memory::ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
 
 #else
 
-static struct sigaction OldSaSegv;
-static struct sigaction OldSaBus;
+static struct sigaction OldSaSegv {};
+static struct sigaction OldSaBus {};
+
+static void ChainOldSignalHandler(int sig, siginfo_t* info, void* rawContext,
+                                  void (*selfHandler)(int, siginfo_t*, void*))
+{
+    struct sigaction* oldSa = nullptr;
+    if (sig == SIGSEGV)
+        oldSa = &OldSaSegv;
+    else if (sig == SIGBUS)
+        oldSa = &OldSaBus;
+
+    if (oldSa != nullptr)
+    {
+        if (oldSa->sa_flags & SA_SIGINFO)
+        {
+            if (oldSa->sa_sigaction != nullptr && oldSa->sa_sigaction != selfHandler)
+            {
+                oldSa->sa_sigaction(sig, info, rawContext);
+                return;
+            }
+        }
+        else if (oldSa->sa_handler == SIG_IGN)
+        {
+            return;
+        }
+        else if (oldSa->sa_handler != SIG_DFL && oldSa->sa_handler != nullptr)
+        {
+            oldSa->sa_handler(sig);
+            return;
+        }
+    }
+
+    struct sigaction dfl {};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, nullptr);
+    sigset_t unblockSet;
+    sigemptyset(&unblockSet);
+    sigaddset(&unblockSet, sig);
+    sigprocmask(SIG_UNBLOCK, &unblockSet, nullptr);
+    raise(sig);
+}
 
 void ARMJIT_Memory::SigsegvHandler(int sig, siginfo_t* info, void* rawContext)
 {
-    if (sig != SIGSEGV && sig != SIGBUS)
+    melonDS::NDS* cur = NDS::Current;
+    if (cur == nullptr || (sig != SIGSEGV && sig != SIGBUS) ||
+        info == nullptr || rawContext == nullptr ||
+        (info->si_code != SEGV_MAPERR && info->si_code != SEGV_ACCERR))
     {
-        // We are not interested in other signals - handle it as usual.
-        return;
-    }
-    if (info->si_code != SEGV_MAPERR && info->si_code != SEGV_ACCERR)
-    {
-        // Huh? Return.
+        ChainOldSignalHandler(sig, info, rawContext, &SigsegvHandler);
         return;
     }
 
     ucontext_t* context = (ucontext_t*)rawContext;
+    u8* faultPC = (u8*)context->CONTEXT_PC;
+    u8* curArea = (u8*)(cur->CurCPU == 0 ? cur->JIT.Memory.FastMem9Start : cur->JIT.Memory.FastMem7Start);
+    uintptr_t faultAddr = reinterpret_cast<uintptr_t>(info->si_addr);
+    uintptr_t areaStart = reinterpret_cast<uintptr_t>(curArea);
 
-    FaultDescription desc {};
-    u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
-
-    desc.EmulatedFaultAddr = (u8*)info->si_addr - curArea;
-    desc.FaultPC = (u8*)context->CONTEXT_PC;
-
-    if (FaultHandler(desc, *NDS::Current))
+    if (curArea != nullptr &&
+        faultAddr >= areaStart && (faultAddr - areaStart) < AddrSpaceSize &&
+        cur->JIT.JITCompiler.IsJITFault(faultPC))
     {
-        context->CONTEXT_PC = (u64)desc.FaultPC;
-        return;
+        FaultDescription desc {};
+        desc.EmulatedFaultAddr = static_cast<u32>(faultAddr - areaStart);
+        desc.FaultPC = faultPC;
+
+        if (FaultHandler(desc, *cur))
+        {
+            context->CONTEXT_PC = (u64)desc.FaultPC;
+            return;
+        }
     }
 
-    struct sigaction* oldSa;
-    if (sig == SIGSEGV)
-      oldSa = &OldSaSegv;
-    else
-      oldSa = &OldSaBus;
-
-    if (oldSa->sa_flags & SA_SIGINFO)
-    {
-      oldSa->sa_sigaction(sig, info, rawContext);
-      return;
-    }
-    if (oldSa->sa_handler == SIG_DFL)
-    {
-      signal(sig, SIG_DFL);
-      return;
-    }
-    if (oldSa->sa_handler == SIG_IGN)
-    {
-      // Ignore signal
-      return;
-    }
-    oldSa->sa_handler(sig);
+    ChainOldSignalHandler(sig, info, rawContext, &SigsegvHandler);
 }
 
 #endif
@@ -811,9 +856,21 @@ void ARMJIT_Memory::UnregisterFaultHandler()
         KernelBaseDll = nullptr;
     }
 #else
-    sigaction(SIGSEGV, &OldSaSegv, nullptr);
+    struct sigaction curSa {};
+    if (sigaction(SIGSEGV, nullptr, &curSa) == 0 &&
+        (curSa.sa_flags & SA_SIGINFO) &&
+        curSa.sa_sigaction == &SigsegvHandler)
+    {
+        sigaction(SIGSEGV, &OldSaSegv, nullptr);
+    }
 #ifdef __APPLE__
-    sigaction(SIGBUS, &OldSaBus, nullptr);
+    curSa = {};
+    if (sigaction(SIGBUS, nullptr, &curSa) == 0 &&
+        (curSa.sa_flags & SA_SIGINFO) &&
+        curSa.sa_sigaction == &SigsegvHandler)
+    {
+        sigaction(SIGBUS, &OldSaBus, nullptr);
+    }
 #endif
 #endif
 }
