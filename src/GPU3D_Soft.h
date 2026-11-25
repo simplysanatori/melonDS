@@ -501,6 +501,13 @@ private:
     std::atomic_bool RenderThreadRunning;
     std::atomic_bool RenderThreadRendering;
 
+    // The frames the main thread asked the render thread for and did not wait for yet.
+    // The main thread's own: the render thread never touches it.
+    int RenderThreadPending = 0;
+
+    // Waits until the render thread is done with all it was asked for.
+    void WaitForRenderThread();
+
     // Used by the main thread to tell the render thread to start rendering a frame
     Platform::Semaphore* Sema_RenderStart;
 

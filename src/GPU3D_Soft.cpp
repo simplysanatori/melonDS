@@ -42,7 +42,14 @@ void SoftRenderer3D::StopRenderThread()
         Platform::Thread_Wait(RenderThread);
         Platform::Thread_Free(RenderThread);
         RenderThread = nullptr;
+        RenderThreadPending = 0; // whatever was asked for is not coming any more
     }
+}
+
+void SoftRenderer3D::WaitForRenderThread()
+{
+    for (; RenderThreadPending > 0; RenderThreadPending--)
+        Platform::Semaphore_Wait(Sema_RenderDone);
 }
 
 void SoftRenderer3D::SetupRenderThread()
@@ -57,13 +64,12 @@ void SoftRenderer3D::SetupRenderThread()
             });
         }
 
-        // "Be on standby, but don't start rendering until I tell you to!"
-        Platform::Semaphore_Reset(Sema_RenderStart);
-
         // "Oh, sorry, were you already in the middle of a frame from the last iteration?"
-        if (RenderThreadRendering)
-            // "Tell me when you're done, I'll wait here."
-            Platform::Semaphore_Wait(Sema_RenderDone);
+        // "Tell me when you're done, I'll wait here."
+        // (What was asked for counts here, not RenderThreadRendering: that is cleared only after
+        // Sema_RenderDone is posted, so it can still be set for a frame that was already waited
+        // for, and a wait for that frame never ends.)
+        WaitForRenderThread();
 
         // "All good? Okay, let me give you your training."
         // "(Maybe you're still the same thread, but I have to tell you this stuff anyway.)"
@@ -91,6 +97,7 @@ void SoftRenderer3D::EnableRenderThread()
 {
     if (Threaded && Sema_RenderStart)
     {
+        RenderThreadPending++;
         Platform::Semaphore_Post(Sema_RenderStart);
     }
 }
@@ -1740,7 +1747,7 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
 void SoftRenderer3D::FinishRendering()
 {
     if (RenderThreadRunning.load(std::memory_order_relaxed) && !GPU3D.AbortFrame)
-        Platform::Semaphore_Wait(Sema_RenderDone);
+        WaitForRenderThread();
 }
 
 void SoftRenderer3D::RenderFrame()
@@ -1756,6 +1763,7 @@ void SoftRenderer3D::RenderFrame()
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
         // "Render thread, you're up! Get moving."
+        RenderThreadPending++;
         Platform::Semaphore_Post(Sema_RenderStart);
     }
     else if (!FrameIdentical)
